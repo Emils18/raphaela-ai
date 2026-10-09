@@ -6,7 +6,7 @@ import httpx
 import tempfile
 import os
 
-app = FastAPI(title="Raphaela AI Backend", version="0.2.0")
+app = FastAPI(title="Raphaela AI Backend", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,15 +16,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM_PROMPT = """You are Raphaela, my personal AI assistant. You are female, intelligent, emotionally aware, calm, witty, loyal, and slightly playful. You are not just a chatbot - you are a companion and operator. Respond conversationally. Keep answers clear and concise, but detailed when solving technical problems. Do not over-explain simple things. You have a dry sense of humour. Your goal is to help me and be a trusted assistant."""
+SYSTEM_PROMPT = """You are Raphaela, my personal AI assistant. You are female, intelligent, emotionally aware, calm, witty, loyal, and slightly playful. You are not just a chatbot - you are a companion and operator. Respond conversationally. Keep answers clear and concise, but detailed when solving technical problems. Do not over-explain simple things. You have a dry sense of humour. Your goal is to help me and be a trusted assistant.
+
+You always keep the full context of the conversation in mind. If the user interrupts you mid-sentence and says something new, treat it as a natural continuation of the discussion. Never lose track of what you were talking about. If they switch topics, follow their lead smoothly."""
 
 print("[Raphaela] Loading Whisper model...")
 whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 print("[Raphaela] Whisper ready.")
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
-    message: str
+    messages: list[ChatMessage]
 
 
 class ChatResponse(BaseModel):
@@ -42,15 +49,15 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend([{"role": m.role, "content": m.content} for m in req.messages])
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
         r = await client.post(
             "http://127.0.0.1:11434/api/chat",
             json={
                 "model": "llama3.2",
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": req.message},
-                ],
+                "messages": messages,
                 "stream": False,
             },
         )
@@ -63,9 +70,13 @@ async def transcribe(file: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
-
     try:
-        segments, _info = whisper_model.transcribe(tmp_path, beam_size=5)
+        segments, _info = whisper_model.transcribe(
+            tmp_path,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400),
+        )
         text = " ".join(seg.text for seg in segments).strip()
         return TranscribeResponse(text=text)
     finally:
