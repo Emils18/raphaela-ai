@@ -11,6 +11,8 @@ dependencies:
     sdk: flutter
   flutter_tts: ^4.2.5
   http: ^1.2.0
+  path_provider: ^2.1.6
+  record: ^7.1.2
 
 dev_dependencies:
   flutter_test:

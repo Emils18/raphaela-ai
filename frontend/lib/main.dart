@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
 
 void main() {
   runApp(const RaphaelaApp());
@@ -45,6 +47,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen> {
   String _conversationText = 'System online. Raphaela standing by.';
   final TextEditingController _inputController = TextEditingController();
   final FlutterTts _tts = FlutterTts();
+  final AudioRecorder _recorder = AudioRecorder();
   static const String _backendUrl = 'http://127.0.0.1:8000';
 
   @override
@@ -102,6 +105,76 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen> {
       setState(() {
         _currentState = AIState.idle;
         _conversationText = 'Connection error: $e';
+      });
+    }
+  }
+
+  Future<void> _toggleRecording() async {
+    if (_currentState == AIState.listening) {
+      final path = await _recorder.stop();
+      if (path == null) return;
+      setState(() {
+        _currentState = AIState.thinking;
+        _conversationText = 'Transcribing...';
+      });
+      await _transcribeAndRespond(path);
+      return;
+    }
+
+    if (!await _recorder.hasPermission()) {
+      setState(() {
+        _conversationText = 'Microphone permission denied.';
+      });
+      return;
+    }
+
+    final dir = await getTemporaryDirectory();
+    final path = '${dir.path}/raphaela_input.wav';
+    await _recorder.start(
+      const RecordConfig(encoder: AudioEncoder.wav),
+      path: path,
+    );
+    setState(() {
+      _currentState = AIState.listening;
+      _conversationText = 'Listening... (tap mic again to stop)';
+    });
+  }
+
+  Future<void> _transcribeAndRespond(String audioPath) async {
+    try {
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse('$_backendUrl/transcribe'),
+      );
+      request.files.add(await http.MultipartFile.fromPath('file', audioPath));
+      final streamed = await request.send();
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode != 200) {
+        setState(() {
+          _currentState = AIState.idle;
+          _conversationText = 'Transcription failed: ${response.statusCode}';
+        });
+        return;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final userText = (data['text'] ?? '').toString().trim();
+
+      if (userText.isEmpty) {
+        setState(() {
+          _currentState = AIState.idle;
+          _conversationText = "I didn't catch that. Try again?";
+        });
+        return;
+      }
+
+      _inputController.text = userText;
+      await _sendMessage();
+    } catch (e) {
+      setState(() {
+        _currentState = AIState.idle;
+        _conversationText = 'Voice error: $e';
       });
     }
   }
@@ -216,26 +289,44 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen> {
                   const SizedBox(height: 16),
                   Row(
                     children: [
+                      FloatingActionButton(
+                        heroTag: 'mic',
+                        onPressed: _toggleRecording,
+                        backgroundColor: _currentState == AIState.listening
+                            ? const Color(0xFFE53935)
+                            : const Color(0xFF7C4DFF),
+                        child: Icon(
+                          _currentState == AIState.listening
+                              ? Icons.stop
+                              : Icons.mic,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
                       Expanded(
                         child: TextField(
                           controller: _inputController,
                           style: const TextStyle(color: Colors.white),
                           decoration: InputDecoration(
                             hintText: 'Type a message to Raphaela...',
-                            hintStyle: const TextStyle(color: Color(0xFF64748B)),
+                            hintStyle:
+                                const TextStyle(color: Color(0xFF64748B)),
                             filled: true,
                             fillColor: const Color(0xFF121826),
                             border: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: Color(0xFF1E293B)),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFF1E293B)),
                             ),
                             enabledBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: Color(0xFF1E293B)),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFF1E293B)),
                             ),
                             focusedBorder: OutlineInputBorder(
                               borderRadius: BorderRadius.circular(12),
-                              borderSide: const BorderSide(color: Color(0xFF00E5FF)),
+                              borderSide:
+                                  const BorderSide(color: Color(0xFF00E5FF)),
                             ),
                           ),
                           onSubmitted: (_) => _sendMessage(),
@@ -243,9 +334,11 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen> {
                       ),
                       const SizedBox(width: 12),
                       FloatingActionButton(
+                        heroTag: 'send',
                         onPressed: _sendMessage,
                         backgroundColor: const Color(0xFF00E5FF),
-                        child: const Icon(Icons.send, color: Color(0xFF0A0E17)),
+                        child:
+                            const Icon(Icons.send, color: Color(0xFF0A0E17)),
                       ),
                     ],
                   ),
