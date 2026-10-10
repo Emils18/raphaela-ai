@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -49,13 +50,14 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
   String _conversationText = 'System online. Raphaela standing by.';
   final TextEditingController _inputController = TextEditingController();
   final FocusNode _inputFocus = FocusNode();
-  final FlutterTts _tts = FlutterTts();
+ final FlutterTts _tts = FlutterTts();
+  final AudioPlayer _audioPlayer = AudioPlayer();
   final AudioRecorder _recorder = AudioRecorder();
   static const String _backendUrl = 'http://127.0.0.1:8000';
 
   // === TUNED THRESHOLDS ===
-  static const double _voiceThreshold = -28.0;  // Normal speaking level
-  static const int _silenceToStopMs = 2600;     // 2.6s pause: she will NEVER cut you off mid-sentence
+  static const double _voiceThreshold = -33.0;  // Catches soft whispers, trailing words, and breaths
+  static const int _silenceToStopMs = 3200;     // 3.2s of total dead silence required before she assumes you're done
   static const double _bargeThreshold = -20.0;  // Sensitive enough to interrupt with normal speaking voice
 
   double _currentDb = -60.0;
@@ -88,8 +90,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     )..repeat();
 
     _setupTts();
-
-    
+    _loadMemoryOnStartup();
   }
 
   @override
@@ -102,6 +103,31 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     _recorder.dispose();
     super.dispose();
   }
+
+
+Future<void> _loadMemoryOnStartup() async {
+    try {
+      final resp = await http.get(Uri.parse('$_backendUrl/history'));
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(resp.body) as Map<String, dynamic>;
+        final msgs = (data['messages'] as List?) ?? [];
+        if (msgs.isNotEmpty) {
+          _history.clear();
+          for (final m in msgs) {
+            _history.add({
+              'role': m['role'].toString(),
+              'content': m['content'].toString(),
+            });
+          }
+          final last = _history.last;
+          setState(() {
+            _conversationText = '${last['role'] == 'user' ? 'You' : 'Raphaela'}: ${last['content']}';
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
 
   Future<void> _setupTts() async {
     await _tts.awaitSpeakCompletion(false);
@@ -123,8 +149,8 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
       }
     } catch (_) {}
 
-    await _tts.setPitch(1.15);
-    await _tts.setSpeechRate(0.50);
+    await _tts.setPitch(1.0);       // Natural pitch
+    await _tts.setSpeechRate(0.48);  // Smooth, calm pacing
 
     _tts.setCompletionHandler(() => _handleSpeakComplete());
     _tts.setCancelHandler(() => _handleSpeakComplete());
@@ -167,29 +193,30 @@ Future<void> _handleSpeakComplete() async {
         .trim();
   }
 
-  Future<void> _speak(String text) async {
+Future<void> _speak(String text) async {
     _ttsSafetyTimer?.cancel();
-    final cleanSpeech = _cleanTextForTts(text);
-
-    if (cleanSpeech.isEmpty) {
-      _handleSpeakComplete();
-      return;
-    }
 
     setState(() => _currentState = AIState.speaking);
     _bargedIn = false;
 
     await _startBargeIn();
-    await _tts.speak(cleanSpeech);
 
-    final wordCount = cleanSpeech.split(' ').length;
-    final estimatedSeconds = (wordCount / 2.3).clamp(2.0, 35.0);
-    _ttsSafetyTimer = Timer(Duration(milliseconds: (estimatedSeconds * 1000).toInt() + 1500), () {
-      if (_currentState == AIState.speaking) {
-        _handleSpeakComplete();
-      }
-    });
+    // Plays Ava's human voice directly from the backend
+    try {
+      await _audioPlayer.play(
+        UrlSource('$_backendUrl/voice?t=${DateTime.now().millisecondsSinceEpoch}')
+      );
+      _audioPlayer.onPlayerComplete.listen((_) {
+        if (_currentState == AIState.speaking) {
+          _handleSpeakComplete();
+        }
+      });
+    } catch (_) {
+      _handleSpeakComplete();
+    }
   }
+
+
 
 Future<void> _startBargeIn() async {
     if (!await _recorder.hasPermission()) return;
@@ -220,8 +247,9 @@ Future<void> _startBargeIn() async {
         final duration = DateTime.now().difference(loudStartTime!).inMilliseconds;
         
         // 180ms of normal speaking voice instantly halts her
-        if (duration >= 180 && !_bargedIn && _currentState == AIState.speaking) {
+       if (duration >= 180 && !_bargedIn && _currentState == AIState.speaking) {
           _bargedIn = true;
+          await _audioPlayer.stop();
           await _tts.stop();
           await _handleSpeakComplete();
         }
@@ -294,11 +322,16 @@ Future<void> _startBargeIn() async {
       final silentFor =
           lastVoiceHeard == null ? 0 : now.difference(lastVoiceHeard!).inMilliseconds;
 
-      if (elapsed > 25000) {
+   // Max safety: 35 seconds
+      if (elapsed > 35000) {
         if (!done.isCompleted) done.complete();
-      } else if (speechDetected && silentFor > _silenceToStopMs && elapsed > 800) {
+      } 
+      // Only finish when you have been completely quiet for 3.2 full seconds
+      else if (speechDetected && silentFor > _silenceToStopMs && elapsed > 1500) {
         if (!done.isCompleted) done.complete();
-      } else if (!speechDetected && elapsed > 5000) {
+      } 
+      // Give you up to 10 seconds of thinking time before resetting
+      else if (!speechDetected && elapsed > 10000) {
         if (!done.isCompleted) done.complete();
       }
     });
