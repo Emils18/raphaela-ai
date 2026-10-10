@@ -53,15 +53,12 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
   final AudioRecorder _recorder = AudioRecorder();
   static const String _backendUrl = 'http://127.0.0.1:8000';
 
-  // === TUNABLES ===
-  static const double _voiceThreshold = -28;   // higher = stricter (only louder voice triggers)
-  static const int _minVoiceDurationMs = 400;  // sustained speech needed
-  static const int _silenceToStopMs = 10000;   // 10s silence -> done talking
-  static const int _bargeThreshold = -20;      // barge-in trigger level
-  static const int _bargeSustainMs = 250;      // must speak this long to interrupt
-  static const int _bargeIgnoreMs = 500;       // ignore first 500ms of her speaking
+  // === TUNED THRESHOLDS ===
+  static const double _voiceThreshold = -28.0;  // Normal speaking level
+  static const int _silenceToStopMs = 2600;     // 2.6s pause: she will NEVER cut you off mid-sentence
+  static const double _bargeThreshold = -20.0;  // Sensitive enough to interrupt with normal speaking voice
 
-  // Conversation history — remembered across turns and interrupts
+  double _currentDb = -60.0;
   final List<Map<String, String>> _history = [];
 
   bool _autoListen = true;
@@ -69,6 +66,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
   bool _bargedIn = false;
   int _emptyTries = 0;
 
+  Timer? _ttsSafetyTimer;
   StreamSubscription<Amplitude>? _ampSub;
   StreamSubscription<Amplitude>? _bargeSub;
 
@@ -91,14 +89,12 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
 
     _setupTts();
 
-    _inputFocus.addListener(() {
-      if (_inputFocus.hasFocus) _autoListen = false;
-      setState(() {});
-    });
+    
   }
 
   @override
   void dispose() {
+    _ttsSafetyTimer?.cancel();
     _pulse.dispose();
     _rotate.dispose();
     _inputController.dispose();
@@ -108,7 +104,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
   }
 
   Future<void> _setupTts() async {
-    await _tts.awaitSpeakCompletion(true);
+    await _tts.awaitSpeakCompletion(false);
     await _tts.setLanguage('en-US');
 
     try {
@@ -128,37 +124,77 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     } catch (_) {}
 
     await _tts.setPitch(1.15);
-    await _tts.setSpeechRate(0.48);
+    await _tts.setSpeechRate(0.50);
 
     _tts.setCompletionHandler(() => _handleSpeakComplete());
+    _tts.setCancelHandler(() => _handleSpeakComplete());
+    _tts.setErrorHandler((_) => _handleSpeakComplete());
   }
 
-  Future<void> _handleSpeakComplete() async {
+
+Future<void> _handleSpeakComplete() async {
+    _ttsSafetyTimer?.cancel();
     await _stopBargeIn();
     if (!mounted) return;
-    setState(() => _currentState = AIState.idle);
 
     final wasBarge = _bargedIn;
     _bargedIn = false;
 
     if (wasBarge) {
-      // User interrupted → listen right away
-      Future.delayed(const Duration(milliseconds: 150), _listenOnce);
+      setState(() {
+        _currentState = AIState.listening;
+        _conversationText = 'Listening to you...';
+      });
+      // 400ms pause to let Windows audio release mic cleanly
+      await Future.delayed(const Duration(milliseconds: 400));
+      if (mounted) _listenOnce();
     } else if (_autoListen) {
-      Future.delayed(const Duration(milliseconds: 300), _listenOnce);
+      setState(() => _currentState = AIState.idle);
+      await Future.delayed(const Duration(milliseconds: 250));
+      if (mounted) _listenOnce();
+    } else {
+      setState(() => _currentState = AIState.idle);
     }
   }
 
-  Future<void> _speak(String text) async {
-    setState(() => _currentState = AIState.speaking);
-    _bargedIn = false;
-    await _startBargeIn();
-    await _tts.speak(text);
+
+  String _cleanTextForTts(String raw) {
+    return raw
+        .replaceAll(RegExp(r'\*.*?\*'), '')
+        .replaceAll(RegExp(r'[#*_~`"]'), '')
+        .replaceAll(RegExp(r'\(.*?\)'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
   }
 
-  Future<void> _startBargeIn() async {
+  Future<void> _speak(String text) async {
+    _ttsSafetyTimer?.cancel();
+    final cleanSpeech = _cleanTextForTts(text);
+
+    if (cleanSpeech.isEmpty) {
+      _handleSpeakComplete();
+      return;
+    }
+
+    setState(() => _currentState = AIState.speaking);
+    _bargedIn = false;
+
+    await _startBargeIn();
+    await _tts.speak(cleanSpeech);
+
+    final wordCount = cleanSpeech.split(' ').length;
+    final estimatedSeconds = (wordCount / 2.3).clamp(2.0, 35.0);
+    _ttsSafetyTimer = Timer(Duration(milliseconds: (estimatedSeconds * 1000).toInt() + 1500), () {
+      if (_currentState == AIState.speaking) {
+        _handleSpeakComplete();
+      }
+    });
+  }
+
+Future<void> _startBargeIn() async {
     if (!await _recorder.hasPermission()) return;
     try {
+      if (await _recorder.isRecording()) await _recorder.stop();
       final dir = await getTemporaryDirectory();
       await _recorder.start(
         const RecordConfig(encoder: AudioEncoder.wav),
@@ -169,25 +205,28 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     }
 
     final startedAt = DateTime.now();
-    DateTime? sustained;
+    DateTime? loudStartTime;
 
     _bargeSub = _recorder
-        .onAmplitudeChanged(const Duration(milliseconds: 80))
-        .listen((amp) {
-      // Ignore her own TTS kickoff
-      if (DateTime.now().difference(startedAt).inMilliseconds < _bargeIgnoreMs) {
-        return;
-      }
+        .onAmplitudeChanged(const Duration(milliseconds: 50))
+        .listen((amp) async {
+      if (mounted) setState(() => _currentDb = amp.current);
+
+      // Give her 500ms to begin speaking cleanly
+      if (DateTime.now().difference(startedAt).inMilliseconds < 500) return;
+
       if (amp.current > _bargeThreshold) {
-        sustained ??= DateTime.now();
-        if (!_bargedIn &&
-            DateTime.now().difference(sustained!).inMilliseconds >=
-                _bargeSustainMs) {
+        loudStartTime ??= DateTime.now();
+        final duration = DateTime.now().difference(loudStartTime!).inMilliseconds;
+        
+        // 180ms of normal speaking voice instantly halts her
+        if (duration >= 180 && !_bargedIn && _currentState == AIState.speaking) {
           _bargedIn = true;
-          _tts.stop();
+          await _tts.stop();
+          await _handleSpeakComplete();
         }
       } else {
-        sustained = null;
+        loudStartTime = null;
       }
     });
   }
@@ -196,7 +235,9 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     await _bargeSub?.cancel();
     _bargeSub = null;
     try {
-      await _recorder.stop();
+      if (await _recorder.isRecording()) {
+        await _recorder.stop();
+      }
     } catch (_) {}
   }
 
@@ -209,54 +250,55 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
       });
       return;
     }
+
     _isBusy = true;
     final dir = await getTemporaryDirectory();
     final path = '${dir.path}/raphaela_input.wav';
-    await _recorder.start(
-      const RecordConfig(encoder: AudioEncoder.wav),
-      path: path,
-    );
+
+    try {
+      if (await _recorder.isRecording()) {
+        await _recorder.stop();
+      }
+      await _recorder.start(
+        const RecordConfig(encoder: AudioEncoder.wav),
+        path: path,
+      );
+    } catch (e) {
+      _isBusy = false;
+      setState(() => _currentState = AIState.idle);
+      return;
+    }
+
     setState(() {
       _currentState = AIState.listening;
       _conversationText = 'Listening...';
     });
 
     final start = DateTime.now();
-    DateTime? lastLoud;
-    DateTime? sustainedStart;
-    bool voiceConfirmed = false;
+    DateTime? lastVoiceHeard;
+    bool speechDetected = false;
     final done = Completer<void>();
 
     _ampSub = _recorder
-        .onAmplitudeChanged(const Duration(milliseconds: 120))
+        .onAmplitudeChanged(const Duration(milliseconds: 100))
         .listen((amp) {
       final now = DateTime.now();
+      if (mounted) setState(() => _currentDb = amp.current);
 
       if (amp.current > _voiceThreshold) {
-        sustainedStart ??= now;
-        // Require minimum sustained voice to count as real speech
-        if (!voiceConfirmed &&
-            now.difference(sustainedStart!).inMilliseconds >=
-                _minVoiceDurationMs) {
-          voiceConfirmed = true;
-        }
-        lastLoud = now;
-      } else {
-        sustainedStart = null;
+        speechDetected = true;
+        lastVoiceHeard = now;
       }
 
       final elapsed = now.difference(start).inMilliseconds;
       final silentFor =
-          lastLoud == null ? 0 : now.difference(lastLoud!).inMilliseconds;
+          lastVoiceHeard == null ? 0 : now.difference(lastVoiceHeard!).inMilliseconds;
 
-      // Hard safety 60s
-      if (elapsed > 60000) {
+      if (elapsed > 25000) {
         if (!done.isCompleted) done.complete();
-      }
-      // Only stop early if we confirmed real speech AND user is quiet
-      else if (voiceConfirmed &&
-          silentFor > _silenceToStopMs &&
-          elapsed > 1500) {
+      } else if (speechDetected && silentFor > _silenceToStopMs && elapsed > 800) {
+        if (!done.isCompleted) done.complete();
+      } else if (!speechDetected && elapsed > 5000) {
         if (!done.isCompleted) done.complete();
       }
     });
@@ -269,17 +311,9 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     _isBusy = false;
     if (saved == null) return;
 
-    // Never heard real speech? Skip Whisper entirely
-    if (!voiceConfirmed) {
-      _emptyTries++;
-      if (_autoListen && _emptyTries < 3) {
-        _listenOnce();
-      } else {
-        setState(() {
-          _currentState = AIState.idle;
-          _emptyTries = 0;
-        });
-      }
+    if (!speechDetected) {
+      // Never go to IDLE: immediately keep listening!
+      if (mounted) _listenOnce();
       return;
     }
 
@@ -376,10 +410,20 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
               padding: const EdgeInsets.all(24.0),
               child: Column(
                 children: [
-                  _animatedOrb(color),
-                  const SizedBox(height: 16),
+                  GestureDetector(
+                    onTap: () {
+                      if (_currentState == AIState.speaking) {
+                        _tts.stop();
+                        _handleSpeakComplete();
+                      } else if (_currentState == AIState.idle) {
+                        _listenOnce();
+                      }
+                    },
+                    child: _animatedOrb(color),
+                  ),
+                  const SizedBox(height: 12),
                   AnimatedDefaultTextStyle(
-                    duration: const Duration(milliseconds: 400),
+                    duration: const Duration(milliseconds: 300),
                     style: TextStyle(
                       color: color,
                       letterSpacing: 2,
@@ -388,20 +432,11 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
                     ),
                     child: Text('STATUS: ${_currentState.name.toUpperCase()}'),
                   ),
-                  const SizedBox(height: 6),
-                  Text(
-                    _autoListen ? 'AUTO-LISTEN: ON' : 'AUTO-LISTEN: OFF',
-                    style: TextStyle(
-                      color: _autoListen
-                          ? const Color(0xFF00E676)
-                          : const Color(0xFF64748B),
-                      fontSize: 10,
-                      letterSpacing: 1.5,
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  _conversationBox(),
+                  const SizedBox(height: 4),
+                  _liveAudioMeter(),
                   const SizedBox(height: 16),
+                  _conversationBox(),
+                  const SizedBox(height: 14),
                   _inputRow(),
                 ],
               ),
@@ -412,40 +447,55 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     );
   }
 
+  Widget _liveAudioMeter() {
+    final normalized = ((_currentDb + 60) / 60).clamp(0.0, 1.0);
+    return Column(
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              'MIC LEVEL: ${_currentDb.toStringAsFixed(1)} dB (TRIGGER: $_voiceThreshold dB)',
+              style: const TextStyle(fontSize: 10, color: Color(0xFF64748B), letterSpacing: 1.2),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        SizedBox(
+          width: 220,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: normalized,
+              backgroundColor: const Color(0xFF1E293B),
+              valueColor: AlwaysStoppedAnimation<Color>(
+                _currentDb > _voiceThreshold ? const Color(0xFF00E676) : const Color(0xFF00E5FF),
+              ),
+              minHeight: 4,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _titleBar() {
     return Container(
       height: 40,
       color: const Color(0xFF070A10),
       padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: const Row(
         children: [
-          const Row(
-            children: [
-              Icon(Icons.hexagon, color: Color(0xFF00E5FF), size: 18),
-              SizedBox(width: 8),
-              Text(
-                'RAPHAELA // PERSONAL AI',
-                style: TextStyle(
-                  color: Color(0xFF00E5FF),
-                  fontSize: 12,
-                  letterSpacing: 1.5,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              IconButton(
-                icon: const Icon(Icons.remove, size: 16),
-                onPressed: () {},
-              ),
-              IconButton(
-                icon: const Icon(Icons.close, size: 16),
-                onPressed: () {},
-              ),
-            ],
+          Icon(Icons.hexagon, color: Color(0xFF00E5FF), size: 18),
+          SizedBox(width: 8),
+          Text(
+            'RAPHAELA // PERSONAL AI',
+            style: TextStyle(
+              color: Color(0xFF00E5FF),
+              fontSize: 12,
+              letterSpacing: 1.5,
+              fontWeight: FontWeight.bold,
+            ),
           ),
         ],
       ),
@@ -454,8 +504,8 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
 
   Widget _animatedOrb(Color color) {
     return SizedBox(
-      width: 200,
-      height: 200,
+      width: 170,
+      height: 170,
       child: AnimatedBuilder(
         animation: Listenable.merge([_pulse, _rotate]),
         builder: (context, _) {
@@ -467,7 +517,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
               Transform.rotate(
                 angle: _rotate.value * 2 * 3.14159,
                 child: CustomPaint(
-                  size: const Size(200, 200),
+                  size: const Size(170, 170),
                   painter: _RingPainter(color),
                 ),
               ),
@@ -475,8 +525,8 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
                 scale: scale,
                 child: AnimatedContainer(
                   duration: const Duration(milliseconds: 500),
-                  width: 140,
-                  height: 140,
+                  width: 120,
+                  height: 120,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
                     gradient: RadialGradient(
@@ -495,7 +545,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
                     ],
                   ),
                   child: Center(
-                    child: Icon(_getStateIcon(), size: 52, color: color),
+                    child: Icon(_getStateIcon(), size: 46, color: color),
                   ),
                 ),
               ),
@@ -510,23 +560,19 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     return Expanded(
       child: Container(
         width: double.infinity,
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(18),
         decoration: BoxDecoration(
           color: const Color(0xFF121826),
           borderRadius: BorderRadius.circular(12),
           border: Border.all(color: const Color(0xFF1E293B)),
         ),
         child: SingleChildScrollView(
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 350),
-            child: Text(
-              _conversationText,
-              key: ValueKey(_conversationText),
-              style: const TextStyle(
-                fontSize: 15,
-                color: Color(0xFF94A3B8),
-                height: 1.5,
-              ),
+          child: Text(
+            _conversationText,
+            style: const TextStyle(
+              fontSize: 14,
+              color: Color(0xFF94A3B8),
+              height: 1.5,
             ),
           ),
         ),
@@ -538,6 +584,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
     return Row(
       children: [
         FloatingActionButton(
+          mini: true,
           heroTag: 'mic',
           onPressed: () {
             setState(() {
@@ -553,6 +600,7 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
           child: Icon(
             _autoListen ? Icons.mic : Icons.mic_off,
             color: Colors.white,
+            size: 18,
           ),
         ),
         const SizedBox(width: 12),
@@ -560,22 +608,23 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
           child: TextField(
             controller: _inputController,
             focusNode: _inputFocus,
-            style: const TextStyle(color: Colors.white),
+            style: const TextStyle(color: Colors.white, fontSize: 14),
             decoration: InputDecoration(
-              hintText: 'Type to Raphaela (pauses auto-listen)...',
+              isDense: true,
+              hintText: 'Type message or speak...',
               hintStyle: const TextStyle(color: Color(0xFF64748B)),
               filled: true,
               fillColor: const Color(0xFF121826),
               border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
                 borderSide: const BorderSide(color: Color(0xFF1E293B)),
               ),
               enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
                 borderSide: const BorderSide(color: Color(0xFF1E293B)),
               ),
               focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
                 borderSide: const BorderSide(color: Color(0xFF00E5FF)),
               ),
             ),
@@ -584,10 +633,11 @@ class _RaphaelaHomeScreenState extends State<RaphaelaHomeScreen>
         ),
         const SizedBox(width: 12),
         FloatingActionButton(
+          mini: true,
           heroTag: 'send',
           onPressed: () => _sendMessage(),
           backgroundColor: const Color(0xFF00E5FF),
-          child: const Icon(Icons.send, color: Color(0xFF0A0E17)),
+          child: const Icon(Icons.send, color: Color(0xFF0A0E17), size: 18),
         ),
       ],
     );
